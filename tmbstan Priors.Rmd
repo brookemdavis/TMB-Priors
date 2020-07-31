@@ -1,0 +1,184 @@
+---
+title: "tmbstan Priors"
+author: "Brooke Davis & Cole Monnahan"
+date: "7/28/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, root.dir = '..')
+
+library(TMB)
+library(pscl) # use this package for nice inverse gamma functions
+library(truncnorm)
+
+#dyn.unload(dynlib("SigmaTest"))
+#TMB::compile("SigmaTest.cpp")
+dyn.load(dynlib("SigmaTest"))
+
+Gam_Dist <- 1
+
+data <- list(Gam_Dist=Gam_Dist)
+param <- list(norm_sigma_bounds=1, norm_logsigma_Jacobian=0, 
+              IG_tau_bounds=1, IG_logsigma_Jacobian=1)
+
+obj <- MakeADFun(data, param, DLL="SigmaTest" )
+obj$fn()
+summary(sdreport(obj))
+
+library(tmbstan)
+library(shinystan)
+
+fitmcmc <- tmbstan(obj, chains=3, iter=200000, thin=10,
+                   lower=c(0,-Inf,0,-Inf), upper=c(Inf, Inf, Inf,Inf))
+# pull out posterior vals
+post <- as.data.frame(fitmcmc)
+```
+
+## Implementing priors in tmbstan
+
+When using TMB and tmbstan to fit a Bayesian model, non-uniform priors may be desired. This vignette covers some of the considerations that need to be taken when implementing priors using tmbstan, and provides two examples for commonly used Bayesian priors (half-normal and inverse gamma). The provided scripts can also be used to test the implementation of other priors. 
+
+### A note on prior choice
+
+We suggest reading [this advice](https://github.com/stan-dev/stan/wiki/Prior-Choice-Recommendations) on prior choice before implementing Bayesian priors (such as an inverse gamma prior on variance).
+
+### Implementing priors on transformed variables
+
+Whenever a prior is implemented on a transformed variable, a Jacobian tranformation needs to be added in order to ensure unbiased estimates. More in-depth description of the theory behind this can be found [here](https://mc-stan.org/docs/2_23/stan-users-guide/changes-of-variables.html) and [here](http://rstudio-pubs-static.s3.amazonaws.com/486816_440106f76c944734a7d4c84761e37388.html). This is a problem often encountered when using tmbstan, since strictly positive variables are often estimated in log space. Therefore, if you wish to put a prior on that variable on that non-transformed variable, a Jacobian adjustment is required. In TMB, which minimized the negative log-likelihood, the Jacobian adjustement is encorporated by subtracting it from the negative log-likelihood. 
+
+### The Jacobian Adjustment
+
+The Jacobian adjustement takes the form of:
+
+$$ log| f(\phi) d / d\phi | $$
+Where $\phi$ is the parameter being estimated, and $f(\phi)$ is the transformation.
+
+### Example 1 - Half-normal Prior on standard deviation
+
+There are two ways to implement this prior -- with and without external bounds. If external bounds are not used, standard deviation is fit in log-space to ensure it remains positive. In this case our parameter will be $log(\sigma)$ rather than $\sigma$. If our estimated parameter is $log(\sigma)$, but our prior is on $\sigma$, a Jacobian adjustment is necessary. Since the transformation ($f(\phi)$) from $log(\sigma)$ to $\sigma$  is $e^{\phi}$ (where $\phi = log(\sigma)$, the parameter being estimated) the jacobian take the form:
+
+$$ log | e^\phi d/d\phi |  =  log | e^{\phi} | \\
+                           =  \phi \\
+                           = log(\sigma) $$
+  
+#### Implementation in TMB  
+
+```{c, eval=F}
+ // use external bounds (no need for fitting in log-space)
+  PARAMETER(norm_sigma_bounds);    
+  // no external bounds, need to fit in log-space to keep positive
+  PARAMETER(norm_logsigma_Jacobian); 
+  
+   // Using external bounds (estimating sigma)
+  ans -= dnorm(norm_sigma_bounds, Type(0.0), Type(1.0), true);
+  // Now version without bounds, using Jacobian (estimating logsigma)
+  Type norm_sigma_Jacobian = exp(norm_logsigma_Jacobian);
+  ans -= dnorm(norm_sigma_Jacobian, Type(0.0), Type(1.0), true);
+  // Jacobian adjustment for norm_logsigma_Jacobian
+  ans -= norm_logsigma_Jacobian;
+```
+  
+### Results
+
+Now we can check the results to make sure that the priors are behaving as expected using each method (using external bounds, or estimating in log-space and using the Jacobian adjustement).
+
+``` {r, half-normal plot, echo = TRUE}
+# Check truncated Normal distributions
+par(mfrow=c(2,1))
+x <- seq(1e-5,10, len=500)
+bb <- 50
+hist(post$norm_sigma_bounds, freq=FALSE, breaks=bb, 
+     main = "Trunc. Normal; External Bounds",
+     xlab = "SD Prior")
+lines(x, dtruncnorm(x, 0,Inf))
+hist(exp(post$norm_logsigma_Jacobian), freq=FALSE, breaks=bb, 
+     main = "Trunc. Normal; Jacobian Adj.",
+     xlab = "SD Prior")
+lines(x, dtruncnorm(x, 0,Inf))
+```
+
+
+### Example 2 - Inverse gamma prior on variance
+
+Inverse gamma priors have been commonly put on variance ($\sigma^2$) parameters, and in the past have been suggested as a good option for a non-informative prior. More recent work has [found issues](http://www.stat.columbia.edu/~gelman/research/published/taumain.pdf) with this family of priors, but their use still persists.
+
+A straight-forward way to implement this prior in TMB (which has a built-in gamma distribution function) is by putting a gamma prior on precision, $\tau$:  
+
+$$\tau = 1/\sigma^2$$
+
+Additionally, since standard deviation is strictly positive, it is common that in a TMB script, that the estimated parameter would be $log(\sigma)$. Since we are putting a prior on $\tau$, which is a tranformation for our parameter, $log(\sigma)$, a Jacobian adjustment is required. In this case, the tranformation, $f(\phi)$, is going from $\phi = log(\sigma)$ to $f(\phi) = \tau$. The Jacobian is therefore:
+
+$$ log | 1/(e^\phi)^2 d/d\phi |  =  log | e^{-2\phi} d/d\phi | \\
+                                 =  log |-2e^{-2\phi}| \\
+                                 = log2 - 2\phi $$
+                                 
+Therefore $log(2) - 2log(\sigma)$ is subtracted from the negative log-likelihood.
+
+
+#### Implementation in TMB
+```{c, eval=F}
+// Same with Inverse Gamma prior
+  PARAMETER(IG_tau_bounds);	// use external bounds
+  PARAMETER(IG_logsigma_Jacobian);	// no external bounds
+  
+  // gamma distribution on tau == inverse gamma on variance
+  // note that gamma in TMB is shape & scale (not shape & rate, like in JAGS)
+  ans -= dgamma(IG_tau_bounds, Gam_Dist, 1/Gam_Dist, true);
+  // Tau = 1/(exp(logSigma))^2
+  Type IG_Tau_Jacobian = pow(exp(IG_logsigma_Jacobian), -2);
+  // Now version with Jocobian
+  ans -= dgamma(IG_Tau_Jacobian, Gam_Dist, 1/Gam_Dist, true);
+  // Jacobian adjustment
+  ans -= log(2) - 2*IG_logsigma_Jacobian;
+```
+  
+``` {r, Inverse gamma plot, echo = TRUE}
+
+# Now Check inverse gamma priors
+par(mfrow=c(2,2))
+# First check that tau is gamma distributed
+hist(post$IG_tau_bounds, freq=FALSE, breaks=bb, xlim = c(0, 10),
+     main = "Gamma on Precision; Bounds", xlab = "Precision")
+lines(x, dgamma(x,Gam_Dist,Gam_Dist))
+hist(1/exp(post$IG_logsigma_Jacobia)^2, freq=FALSE, breaks=bb, xlim = c(0, 10),
+     main = "Gamma on Precision; Jacobian Adj.", xlab = "Precision")
+lines(x, dgamma(x, Gam_Dist,Gam_Dist))
+
+# Also plot hist of variance, which should be inverse gamma dist., as double check
+# This has some very large values that make looking at the histogram difficult
+# remove very large values to help
+VarPost_Bounds <- 1/post$IG_tau_bounds
+VarPost_Bounds_plot <- VarPost_Bounds[VarPost_Bounds<100]
+VarPost_Jacobian <- exp(2*post$IG_logsigma_Jacobian)
+VarPost_Jacobian_plot <- VarPost_Jacobian[VarPost_Jacobian<100]
+# need more breaks for this plot
+bb <- 500
+# cut off hists at 10 so can see distribution more clearly
+hist(VarPost_Bounds_plot, freq=FALSE, breaks=bb, xlim = c(0, 10),
+     main = "InvGamma on Variance; Bounds", xlab = "Variance")
+lines(x, densigamma(x, Gam_Dist,Gam_Dist))
+hist(VarPost_Jacobian_plot, freq=FALSE, breaks=bb, xlim = c(0, 10),
+     main = "InvGamma on Variance; Jacobian Adj.", xlab = "Variance")
+lines(x, densigamma(x, Gam_Dist,Gam_Dist))
+```
+
+We can also compare medians to make double sure things are lining up:
+
+```{r, Check Medians, echo = TRUE }
+# simulate gamma on tau to look at dist and median
+tau_sim <- rgamma(100000, shape = Gam_Dist, rate = Gam_Dist)
+var <- 1/tau_sim
+median(var)
+median(VarPost_Bounds)
+median(VarPost_Jacobian)
+
+
+# simulate inverse gamma directly on variance
+var_sim <- rigamma(100000, alpha = Gam_Dist, beta = Gam_Dist)
+median(var_sim) # same as above
+median(VarPost_Bounds)
+median(VarPost_Jacobian)
+
+
+```
